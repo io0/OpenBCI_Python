@@ -7,7 +7,7 @@ Requires:
   - websockets
 """
 
-import cPickle as pickle
+import _pickle as pickle
 import json
 import socket
 
@@ -65,7 +65,7 @@ class UDPServer(plugintypes.IPluginExtended):
     print("Server started on port " + str(self.port))
 
   def __call__(self, sample): 
-    self.send_data(json.dumps(sample.channel_data))
+    self.send_data(bytes(json.dumps(sample.channel_data),'utf-8'))
     
   def send_data(self, data):
     self.server.sendto(data, (self.ip, self.port))

@@ -99,7 +99,7 @@ class StreamerTCPServer(plugintypes.IPluginExtended):
 	# broadcast channels values to all clients
 	# as_string: many for debug, send values with a nice "[34.45, 30.4, -38.0]"-like format
 	def __call__(self, sample, as_string=False):
-		values=sample.channel_data
+		values=sample.channel_data #********
 		# save sockets that are closed to remove them later on
 		outdated_list = []
 		for sock in self.CONNECTION_LIST:
