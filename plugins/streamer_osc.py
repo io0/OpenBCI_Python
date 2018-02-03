@@ -7,8 +7,12 @@ import numpy as np
 from scipy.signal import welch
 from scipy.stats import zscore, norm
 from sklearn.base import BaseEstimator, TransformerMixin
+import time
+from math import log
+from scipy import signal
 
 # Use OSC protocol to broadcast data (UDP layer), using "/openbci" stream. (NB. does not check numbers of channel as TCP server)
+
 class RingBuffer(np.ndarray):
     """A multidimensional ring buffer."""
 
@@ -52,7 +56,6 @@ class Filterer(BaseEstimator, TransformerMixin):
         self.ssvep_freq = ssvep_freq
         self.ssvep_range_high = ssvep_range_high
         self.ssvep_range_low = ssvep_range_low
-
     def pred_time(self):
         """
         Increments local counter and checks against pred_freq. If self._count is hit, then reset counter and return
@@ -118,7 +121,9 @@ class StreamerOSC(plugintypes.IPluginExtended):
         self.buffer = RingBuffer(np.zeros((2, 2500)))
         self.pred_buffer = RingBuffer(np.zeros((2,3)))
         self.num_samples = 0
-    
+        self.num_windows = 0
+        self.alpha = 0
+        self.beta = 0
     # From IPlugin
     def activate(self):
         if len(self.args) > 0:
@@ -132,12 +137,12 @@ class StreamerOSC(plugintypes.IPluginExtended):
         self.client = udp_client.SimpleUDPClient(self.ip, self.port)
         
         # create filters
-        self.filters.append(Filterer(pred_freq=100,
+        self.filters.append(Filterer(pred_freq=200,
                                      ssvep_freq=7,
                                      epoch=5,
                                      filter_width=0.5))
         
-        self.filters.append(Filterer(pred_freq=100,
+        self.filters.append(Filterer(pred_freq=200,
                                      ssvep_freq=12,
                                      epoch=5,
                                      filter_width=0.5))
@@ -145,6 +150,19 @@ class StreamerOSC(plugintypes.IPluginExtended):
     # From IPlugin: close connections, send message to client
     def deactivate(self):
         self.client.send_message("/quit")
+    def _filter(self, ch):
+        fs_Hz = 250.0
+        hp_cutoff_Hz = 1.0
+        #print("Highpass filtering at: " + str(hp_cutoff_Hz) + " Hz")
+        b, a = signal.butter(2, hp_cutoff_Hz/(fs_Hz / 2.0), 'highpass')
+        ch = signal.lfilter(b, a, ch, 0)
+        notch_freq_Hz = np.array([60.0])  # main + harmonic frequencies
+        for freq_Hz in np.nditer(notch_freq_Hz):  # loop over each target freq
+            bp_stop_Hz = freq_Hz + 3.0*np.array([-1, 1])  # set the stop band
+            b, a = signal.butter(3, bp_stop_Hz/(fs_Hz / 2.0), 'bandstop')
+            ch = signal.lfilter(b, a, ch, 0)
+            #print("Notch filter removing: " + str(bp_stop_Hz[0]) + "-" + str(bp_stop_Hz[1]) + " Hz")
+        return ch
         
     # send channels values
     def __call__(self, sample):
@@ -152,19 +170,55 @@ class StreamerOSC(plugintypes.IPluginExtended):
         try:
             self.buffer.append(sample.channel_data[:2])
             self.num_samples +=1
-            pred_ = []
-            for filter_ in self.filters:
-                if filter_.pred_time():
-                    if self.num_samples > filter_.epoch_in_samples:
-                        pred = filter_.predict_proba(self.buffer[:, -filter_.epoch_in_samples:])
-                        pred_.append(pred)
-                        if (pred > 0.87):
-                            print(filter_.ssvep_freq)
-            self.pred_buffer.append(pred_)
-            
-            self.client.send_message(self.address, sample.channel_data)
+            if self.num_samples > 1250 and self.num_samples < 5000:
+                if (self.num_samples % 250 == 0):
+                    # First we take a welch to decompose the new epoch into fequency and power domains
+                    ch = self._filter(self.buffer[:,-1250:])
+                    freq, psd = welch(ch, int(self.sample_rate), nperseg=1024)
+                    
+                    # Then normalize the power.
+                    # Power follows chi-square distribution, that can be pseudo-normalized by a log (because chi square
+                    #   is aproximately a log-normal distribution)
+                    #psd = np.log(psd)
+                    low_index = np.where(freq > 16)[0][0]
+                    high_index = np.where(freq < 24)[0][-1]
+                    beta = np.mean(psd[low_index:high_index])
+                    low_index = np.where(freq > 7)[0][0]
+                    high_index = np.where(freq < 13)[0][-1]
+                    
+                    alleft = np.mean(psd[0,low_index:high_index])
+                    alright = np.mean(psd[1, low_index:high_index])
+                    if alright == 0:
+                        ratio = -1
+                    else:
+                        ratio = log(alleft/alright)
+                    print("left: %f, right: %f, asym:%f" %(alleft, alright, ratio))
+                    '''
+                    psd = np.mean(psd, axis=0)
+                    
+                    # Next we get the index of the bin we are interested in
+                    low_index = np.where(freq > 16)[0][0]
+                    high_index = np.where(freq < 24)[0][-1]
+                    beta = np.mean(psd[low_index:high_index])
+                    low_index = np.where(freq > 7)[0][0]
+                    high_index = np.where(freq < 13)[0][-1]
+                    alpha = np.mean(psd[low_index:high_index])
+                    print("alpha: %f, beta: %f" % (alpha, beta))
+                    self.alpha += alpha
+                    self.beta += beta
+                    self.num_windows +=1
+                    '''
+            elif self.num_samples == 5000:
+                print("alpha av: %f, beta av: %f"% (self.alpha/self.num_windows, self.beta/self.num_windows))
+                self.num_windows = 0
+                self.alpha = 0
+                self.beta = 0
+            if self.num_samples == 5500:
+                self.num_samples = 0
+            #self.client.send_message(self.address, sample.channel_data)
         except:
             return
+        
 
     def show_help(self):
         print("""Optional arguments: [ip [port [address]]]
